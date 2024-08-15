@@ -85,6 +85,7 @@ EVM: supports data structures such as signed/unsigned integers, booleans, addres
 TVM: TON natively supports only integers, cells, slices, Continuation, Tensors, and other data structures, func currently does not support customized data structures, tact adds boolean, string, address, and other common data structures for smart contracts based on the above types.
 
 # Vulnerability Type
+
 ## GAS Limitation
 
 The gas in the TON chain comes from ctx.value, that is to say, the msg.value on the ETH chain and the gas fee are combined into one. First of all, if you need to recharge the TON native coin TON, you need to subtract the gas value needed for this transaction from this basis, otherwise, it is equivalent to this transaction by the contract to pay for the gas. and since the gas fee is controlled by the user, you can control the gas fee to make the contract in a certain step of the gas fee is not enough so that the problem of backing out occurs. For example:
@@ -273,7 +274,7 @@ contract JettonWallet{
 
 In this simple Jetton implementation, the contract implements the following flow: 
 
-![image-20240813161704417](./README.assets/image-20240813161704417.png)
+![image-20240813161704417](.\README.assets\image-20240813161704417.png)
 
 The above flow may have competing problems, e.g., wallet A has a balance of 5 Jetton, it can send a message to wallet B to transfer 5 Jetton twice, and since A's Jetton balance is not deducted in the first step, both of them can send `InternalTransfer` messages to wallet B without any problem, and wallet B's balance can be increased twice, and B will receive 10 Jetton, even if there is an exception in the third step when the balance is not enough, it will not be rolled back.
 
@@ -424,7 +425,60 @@ contract userWallet{
 
 In the `userWallet` contract, the Transfer message uses `SendRamainingValue` to send a `Transfer` message to the master and triggers the `TransferEvent` event at the end of the contract. Since the gas fee carried by this message has already been sent to the `master` contract with the message, the triggering of this event consumes the internal balance of the contract, and as the number of transactions increases, each event will consume a part of the contract balance, resulting in the contract balance going to zero and freezing.
 
-**Risk level: High**
+**Risk level:  High**
+
+## Variable Override
+
+In func, when processing message logic, the contract state variables need to be extracted or saved by load_data() or save_data(), and the variables that need to be extracted and saved are listed in order, and the order can't be changed, or else there will be the problem of wrong variable assignment. Also, func supports redeclaring variables, which is not a problem with this design, but it can be confusing when saving global variables with save_data(), for example:
+
+```FunC
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int total_supply, slice jetton_master,slice jetton_wallet) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::mint() ){
+        slice jetton_wallet = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        throw_unless(500, msg_value >= (amount + mint_gas()));
+
+        total_supply += amount;
+        sendMsg(bounce::true(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),jetton_master,0,initMintMsg(jetton_wallet, amount));
+        save_data(total_supply,jetton_master,jetton_wallet)
+        return();
+    }
+
+    if ( op == op::transfer_notification() ){;;burn
+        throw_unless(73, equal_slices(sender_address, jetton_wallet));
+        throw_unless(500, msg_value >= burn_gas());
+
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+
+        total_supply -= jetton_amount;
+        sendMsg(bounce::false(),sendMode::NONE(),from_address,jetton_amount,initReplyMsg(jetton_amount));
+        save_data(total_supply,jetton_master,jetton_wallet)
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
+This is a very simple `master` contract, where the user can exchange his ton for a jetton on a one-for-one basis, transfer the ton to the contract to get the jetton via the `mint` message, and then send the jetton to the contract to get the ton back. the above logic i.e. there is a variable override problem, in the `mint` message, the ` jetton_wallet` variable from the message body, due to the same name, the globally stored field is shaded by the local variable, and finally, in the `save_data()` function, the `jetton_wallet` in the message overwrites the stored field in the contract, allowing the attacker to modify the state in the contract, and to use the pseudo jetton contract to take out the ton.
+
+**Risk level:  High**
 
 ## Incorrect Checksum Rules
 
@@ -556,6 +610,7 @@ In the above code, after the user deposits the jetton into the `userWallet` cont
 **Risk Level: Medium**
 
 ## Gas Recovery
+
 Due to the above vulnerability, the developer will limit the number of incoming gas at the beginning of the message flow, even if it is the same entry function, the message flow will not execute all branches every time under certain circumstances, and some messages will be skipped in the middle of the flow, and the gas saved by these skipped messages will need to be refunded to the user. Strictly speaking, this will not lead to some serious problems in the contract, it will only keep the remaining gas in the contract, but it will make the user pay more commission than normal, so it is still recommended to refer to Jetton's standard implementation to return the excess gas as an EXIT message to the user, which is implemented by Jetton as follows:
 
 ```tact
@@ -574,3 +629,34 @@ Due to the above vulnerability, the developer will limit the number of incoming 
 ```
 
 **Risk Level: Low**
+
+# Vulnerability List
+
+| Vulnerability Name                      | Description                                                  | Risk Level |
+| --------------------------------------- | ------------------------------------------------------------ | ---------- |
+| Gas Limitation                          | Not limiting the message flow gas can lead to inconsistent contract states. | Critical   |
+| UnBouncedMessage                        | Handle the necessary bounces to ensure complete message execution. | Critical   |
+| Competitive Conflict                    | Asynchronous execution can have competing problems.          | Critical   |
+| Unbounded Data Structure                | Unbounded data structures can appear `dos`                   | Critical   |
+| Over-reliance States                    | Over-reliance on contract status can be exploited.           | High       |
+| Message Pattern Error                   | Incorrect message mode selection may consume all `Ton`.      | High       |
+| Variable Override                       | Local variables may override global storage.                 | High       |
+| Incorrect CheckSum Rules                | Assertions in some message portals may result in loss of user balances. | Medium     |
+| Erroneous Assertion in the Message Flow | Assertions in the message flow can lead to incomplete message execution. | Medium     |
+| Gas Recovery                            | Recovery of unused gas.                                      | Low        |
+
+# Checklist
+
+- [ ] Calculate the contract message flow gas consumption, and verify that each message flow port correctly limits the gas.
+- [ ] Calibrate whether the location of each thrown exception affects the complete execution of the message flow.
+- [ ] Identify potential competitive conditions: list all the process steps of a transaction and the state changes of each step, create a two-dimensional table, and analyze whether there may be competitive condition issues in concurrent states by looking at the intersection of the states of each step.
+- [ ] Calibrate each data structure such as mapping present in the contract for possible unbounded data.
+- [ ] Note the use of message patterns for each message sent.
+- [ ] Compare the names of local and stored variables for any overlap.
+- [ ] Assume that an exception occurs in each message flow and determine if the exception will be handled correctly.
+- [ ] Avoid using exception termination for cases where the contract has already received an asset.
+- [ ] Calibrate whether excess gas is recovered after each message flow.
+- [ ] Verify that `load_data` and `save_data` are in the correct order of data.
+- [ ] Check that functions in FunC contain the `impure` modifier, otherwise the function may be skipped.
+- [ ] When calling a function, make sure that the function is a modified or unmodified method.
+- [ ] When executing the `rand` function, make sure that each seed is randomized; a fixed-value seed can be brute-force broken.
