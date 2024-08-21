@@ -85,28 +85,28 @@ EVM: supports data structures such as signed/unsigned integers, booleans, addres
 TVM: TON natively supports only integers, cells, slices, Continuation, Tensors, and other data structures, func currently does not support customized data structures, tact adds boolean, string, address, and other common data structures for smart contracts based on the above types.
 
 # Vulnerability Type
-
 ## GAS Limitation
 
 The gas in the TON chain comes from ctx.value, that is to say, the msg.value on the ETH chain and the gas fee are combined into one. First of all, if you need to recharge the TON native coin TON, you need to subtract the gas value needed for this transaction from this basis, otherwise, it is equivalent to this transaction by the contract to pay for the gas. and since the gas fee is controlled by the user, you can control the gas fee to make the contract in a certain step of the gas fee is not enough so that the problem of backing out occurs. For example:
 
+Tact:
+
 ```tact
 const ACC_PRECISION: Int = pow(10, 20);
 contract masterChef{
-    totalsupply: Int as uint64;
+    totalsupply: Int as uint64 = 0;
     minichef: Address;
-    lastRewardBlock: Int as uint64;
-    rewardPerSecond: Int as uint64;
-    accRewardPerShare: Int as uint64;
-    init(minichef: Address) {
+    jettonWallet: Address;
+    lastRewardBlock: Int as uint64 = 0 ;
+    rewardPerSecond: Int as uint64 = 0;
+    accRewardPerShare: Int as uint64 = 0;
+    init(minichef: Address, jettonWallet: Address) {
         self.minichef = minichef;
-        self.totalsupply = 0;
-        self.lastRewardBlock = 0;
-        self.rewardPerSecond = 1000;
-        self.accRewardPerShare = 0;
+        self.jettonWallet = jettonWallet;
     }
     receive(msg: Deposit) { 
         self.updatePool();
+        require(context().sender == self.jettonWallet,"not jettonWallet");
         self.totalsupply += msg.amount;
         msg.toCell().send_to(self.minichef);
     }
@@ -118,7 +118,7 @@ contract masterChef{
     }
 
     receive(msg: WithdrawReply) { 
-        msg.toCell().send_to(self.minichef);
+        require(context().sender == self.minichef,"incorrect sender");
         self.sendJetton(msg.amount,msg.sender);
     }
     inline fun updatePool() {
@@ -153,6 +153,103 @@ contract miniChef{
             sender: msg.sender
         }.toCell().send_to(self.masterchef);
     }
+}
+```
+
+Func:
+
+```func
+;;masterChef
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int total_supply, slice miniChef,slice jetton_wallet, int last_reward_block, int reward_per_second, int acc_reward_per_share) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer_notification() ){;;Deposit
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73, equal_slices(sender_address, jetton_wallet));
+        update_pool();
+        total_supply += amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),miniChef,0,initDepositMsg(from_address, amount));
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+
+        update_pool();
+        total_supply -= jetton_amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),from_address,0,initWithdrawMsg(amount,sender));
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    if ( op == op::withdrawReply() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+
+        send_jetton(amount,sender);
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    throw(0xffff);
+}
+
+
+;;miniChef
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, slice master_chef, int balance) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        throw_unless(73, equal_slices(sender_address, master_chef));
+        slice from_address = in_msg_body~load_msg_addr();
+        int jetton_amount = in_msg_body~load_coins();
+
+        balance += jetton_amount;
+        save_data(owner,master_chef,balance);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+        throw_unless(73, equal_slices(sender_address, master_chef));
+        throw_unless(500,balance >= amount);
+
+        balance -= amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master_chef,0,initWithdrawReplyMsg(amount,sender));
+        save_data(owner,master_chef,balance);
+        return();
+    }
+
+    throw(0xffff);
 }
 ```
 
@@ -170,22 +267,23 @@ Due to the asynchronous nature of the TON chain, it is very easy to have differe
 
 For example:
 
+Tact:
+
 ```tact
 contract masterChef{
-    totalsupply: Int as uint64;
+    totalsupply: Int as uint64 = 0;
     minichef: Address;
-    lastRewardBlock: Int as uint64;
-    rewardPerSecond: Int as uint64;
-    accRewardPerShare: Int as uint64;
-    init(minichef: Address) {
+    jettonWallet: Address;
+    lastRewardBlock: Int as uint64 = 0 ;
+    rewardPerSecond: Int as uint64 = 0;
+    accRewardPerShare: Int as uint64 = 0;
+    init(minichef: Address, jettonWallet: Address) {
         self.minichef = minichef;
-        self.totalsupply = 0;
-        self.lastRewardBlock = 0;
-        self.rewardPerSecond = 1000;
-        self.accRewardPerShare = 0;
+        self.jettonWallet = jettonWallet;
     }
     receive(msg: Deposit) { 
         self.updatePool();
+        require(context().sender == self.jettonWallet,"not jettonWallet");
         self.totalsupply += msg.amount;
         msg.toCell().send_to(self.minichef);
     }
@@ -197,7 +295,7 @@ contract masterChef{
     }
 
     receive(msg: WithdrawReply) { 
-        msg.toCell().send_to(self.minichef);
+        require(context().sender == self.minichef,"incorrect sender");
         self.sendJetton(msg.amount,msg.sender);
     }
     inline fun updatePool() {
@@ -235,6 +333,103 @@ contract miniChef{
 }
 ```
 
+Func:
+
+```Func
+;;masterChef
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int total_supply, slice miniChef,slice jetton_wallet, int last_reward_block, int reward_per_second, int acc_reward_per_share) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer_notification() ){;;Deposit
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73, equal_slices(sender_address, jetton_wallet));
+        update_pool();
+        total_supply += amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),miniChef,0,initDepositMsg(from_address, amount));
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+
+        update_pool();
+        total_supply -= jetton_amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),from_address,0,initWithdrawMsg(amount,sender));
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    if ( op == op::withdrawReply() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+
+        send_jetton(amount,sender);
+        save_data(total_supply,miniChef,jetton_wallet,last_reward_block,reward_per_second,acc_reward_per_share);
+        return();
+    }
+
+    throw(0xffff);
+}
+
+
+;;miniChef
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, slice master_chef, int balance) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        throw_unless(73, equal_slices(sender_address, master_chef));
+        slice from_address = in_msg_body~load_msg_addr();
+        int jetton_amount = in_msg_body~load_coins();
+
+        balance += jetton_amount;
+        save_data(owner,master_chef,balance);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        int amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+        throw_unless(73, equal_slices(sender_address, master_chef));
+        throw_unless(500,balance >= amount);
+
+        balance -= amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master_chef,0,initWithdrawReplyMsg(amount,sender));
+        save_data(owner,master_chef,balance);
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
 When sending `Withdraw` messages for withdrawals, since `miniChef`'s `Withdraw` message has a require check that checks `self.amount` against `msg.amount`, if the amount passed in by the user is greater than their contract balance, `miniChef` will keep backing out, which will cause the `totalSupply` variable to continually becomes smaller, and the user receives an abnormally large reward.
 
 **Risk Level: Critical**
@@ -243,38 +438,100 @@ When sending `Withdraw` messages for withdrawals, since `miniChef`'s `Withdraw` 
 
 Because all contracts in a TON transaction are executed asynchronously, it is possible to continue to send the same message to bypass limits such as balances or boolean values after a contract in the transaction has been executed, if the state has not been modified. For example:
 
+Tact:
+
 ```tact
 contract JettonWallet{
     balance: Int as uint64 = 0;
     owner: Address;
-    init(owner: Address){
+    master: Address;
+    init(owner: Address, master: Address){
         self.owner = owner;
+        self.master = master;
     }
 
     receive(msg: Transfer){
         require(self.balance >= msg.amount, "not enough balance");
+        require(self.owner == context().sender,"not owner");
         InternalTransfer{
             amount: msg.amount,
-            sender: msg.senderWallet
+            sender: self.owner
         }.toCell().send_to(msg.receiverWallet);
     }
 
     receive(msg: InternalTransfer){
+        require(context().sender == contractAddress(initOf JettonWallet(msg.sender, self.master)),"incorrect wallet");
         self.balance += msg.amount;
         TransferReply{
             amount: msg.amount,
-        }.toCell().send_to(msg.sender);
+            sender: self.owner
+        }.toCell().send_to(context().sender);
     }
 
     receive(msg: TransferReply){
+        require(context().sender == contractAddress(initOf JettonWallet(msg.sender, self.master)),"incorrect wallet");
         self.balance -= msg.amount;
     }
 }
 ```
 
+Func:
+
+```func
+;;jettonWallet
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, int balance,cell jetton_wallet_code, slice master) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer() ){
+        slice recv_wallet = in_msg_body~load_msg_addr();
+        int jetton_amount = in_msg_body~load_coins();
+        throw_unless(500, balance >= jetton_amount);
+        throw_unless(73, equal_slices(sender_address, owner));
+
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),recv_wallet,0,initInternalTransferMsg(amount,owner));
+        save_data(owner, balance, jetton_wallet_code, master);
+        return();
+    }
+    if ( op == op::internal_transfer() ){
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        ;;check wallet
+        throw_unless(73, equal_slices(sender_address, getJettonWallet_Address(from_address, master, jetton_wallet_code)));
+        balance += amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),sender_address,0,initTransferReplyMsg(amount,owner));
+        save_data(owner, balance, jetton_wallet_code, master);
+        return();
+    }
+
+    if ( op == op::transfer_reply() ){
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        ;;check wallet
+        throw_unless(73, equal_slices(sender_address, getJettonWallet_Address(from_address, master, jetton_wallet_code)));
+        balance -= amount;
+        save_data(owner, balance, jetton_wallet_code, master);
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
 In this simple Jetton implementation, the contract implements the following flow: 
 
-![image-20240813161704417](./README.assets/image-20240813161704417.png)
+![image-20240813161704417](.\README.assets\image-20240813161704417.png)
 
 The above flow may have competing problems, e.g., wallet A has a balance of 5 Jetton, it can send a message to wallet B to transfer 5 Jetton twice, and since A's Jetton balance is not deducted in the first step, both of them can send `InternalTransfer` messages to wallet B without any problem, and wallet B's balance can be increased twice, and B will receive 10 Jetton, even if there is an exception in the third step when the balance is not enough, it will not be rolled back.
 
@@ -284,9 +541,10 @@ The above flow may have competing problems, e.g., wallet A has a balance of 5 Je
 
 The underlying TVM uses a cell approach to store data, the mapping is implemented as a unit tree, and writing to a leaf in the tree requires writing a new hash along the entire height. If an attacker tries to spam transaction keys in the mapping, some user balances will be pushed so deep into the tree that updating them will exceed the gas limit (currently capped at 1TON per contract). Example:
 
+Tact:
+
 ```tact
 contract stakePool{
-    totalSupply: Int as uint32 = 0;
     userBalance: map<Address,Int>;
 
     receive("deposit") {
@@ -318,8 +576,55 @@ contract stakePool{
                 }.toCell()
             });
 
-    }
+    }  
+}
+```
+
+Func:
+
+```func
+;;stakePool
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (cell userBalance) = load_data();
     
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        throw_unless(500, msg_value >= deposit_fee());
+        int stake_amount = msg_value -deposit_fee();
+        (slice pre_value,int flag) = userBalance.dict_get?(sender_address);
+        if (pre_value == null()){
+            userBalance~dict_set(256,sender_address,stake_amount);
+            save_data(total_supply, userBalance);
+            return();
+        }
+        userBalance~dict_set(256,sender_address,stake_amount + pre_value);
+        save_data(userBalance);
+        return();
+    }
+    if ( op == op::withdraw() ){
+        int amount = in_msg_body~load_coins();
+        slice receiver = in_msg_body~load_msg_addr();
+        (slice pre_value,int flag) = userBalance.dict_get?(sender_address);
+        
+        throw_unless(501,flag);
+        throw_unless(500, pre_value >= amount);
+        userBalance~dict_set(256,sender_address,pre_value - amount);
+        	sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),sender_address,amount,initWithdrawExcessMsg(amount));
+        save_data(userBalance);
+        return();
+    }
+    throw(0xffff);
 }
 ```
 
@@ -332,6 +637,8 @@ To avoid generating too much data, it is recommended to use contract slicing, th
 ## Over-reliance States
 
 In Solidity, state queries between contracts occur very frequently, e.g., to query the contract balance, to query the current price of a pair, etc. In TON, however, relying too much on the state of other contracts can cause serious problems. However, in TON, over-reliance on the states of other contracts can cause serious problems, e.g.:
+
+Tact:
 
 ```tact
 contract aggregator{
@@ -378,6 +685,77 @@ contract pair{
 }
 ```
 
+Func:
+
+```func
+;;aggregator
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice pair, slice USDC_wallet) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer_notification() ){
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        slice forward_payload = in_msg_body;
+        int min_return_amount = forward_payload~load_coins();
+
+        throw_unless(73, equal_slices(sender_address, USDC_wallet));
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),pair,0,initGetAmountOutMsg(jetton_amount, min_return_amount, from_address));
+        save_data(pair, USDC_wallet);
+        return();
+    }
+    if ( op == op::swap_reply() ){
+        throw_unless(73,equal_slices(sender_address, pair));
+        ;;Execute the subsequent swap logic
+        save_data(pair, USDC_wallet);
+        return();
+    }
+    throw(0xffff);
+}
+;;pair
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice aggregator, int reserve0, int reserve1) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::get_amount_out() ){
+        int amount = in_msg_body~load_coins();
+        int min_return_amount = in_msg_body~load_coins();
+        slice sender = in_msg_body~load_msg_addr();
+
+        int return_amount = min_return_amount * reserve0/reserve1;
+        throw_unless(73,return_amount >= min_return_amount);
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),aggregator,0,initSwapReplyMsg(amount, sender));
+        save_data(aggregator, reserve0, reserve1);
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
 Since the interaction between contracts in TON can only be carried out by sending internal messages and cannot be directly queried by get and other functions, the demo performs swap transactions in the following order: the `aggregator` contract receives the `SwapJettonNotification` message - sends a `GetAmountOut` message to the pair contract to query whether the current price meets the `minReturnAmount` requirement - if the price meets the requirement, sends a `SwapReply` to the `aggregator` contract to execute the subsequent swap logic. Send a `GetAmountOut` message to the `pair` contract to check whether the current price meets the requirement of `minReturnAmount` -- If the price meets the requirement, then send `SwapReply` to the `aggregator` contract to execute the subsequent swap logic.
 
 In a public chain with atomic transactions, this process does not cause problems, but due to the asynchronous nature of the TON, none of the above three steps may be in a single block. When the price is queried in the second step, the price may still change, resulting in the tokens eventually being exchanged to the user's hands not meeting the minimum return tokens, but at this time the transaction does not cause problems but is executed normally.
@@ -387,6 +765,8 @@ In a public chain with atomic transactions, this process does not cause problems
 ## Message Pattern Error
 
 There are many message patterns for delivering messages in TON, and you need to choose the message pattern carefully when you send a message. For example, there is `SendRemainingBalance`, which will forward all the balances in the contract to the receiver, and it is usually used together with the message pattern `SendDestroyIfZero` to destroy the contract, which destroys the contract and sends the remaining TON to the receiver, similar to the self-destruct function in the previous Ether. It will destroy the contract and send the remaining TON to the receiver, similar to the previous self-destruct function on Ether. One of the most commonly used message mode is `SendRemainingValue`, using this mode to send a message will forward the remaining gas fee together to the receiver, it will be very convenient to execute in a linear message flow, and it is also a method to recover the gas at the end of the message flow. However, if other processing logic still exists after the message is sent, such as sending events or changing state, it will consume the balance of the contract itself. Example:
+
+Tact:
 
 ```tact
 contract userWallet{
@@ -420,6 +800,52 @@ contract userWallet{
         emit(TransferEvent{sender: self.owner, receiver: msg.receiverWallet, amount: msg.amount}.toCell());
     }
 
+}
+```
+
+Func:
+
+```func
+;;userWallet
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, slice master, int balance) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        int amount = in_msg_body~load_coins();
+        throw_unless(73,equal_slices(sender_address, master));
+
+        balance += amount;
+        save_data(owner, master, balance);
+        return();
+    }
+
+    if ( op == op::transfer() ){
+        throw_unless(500,msg_value >= transfer_fee());
+        throw_unless(73,equal_slices(sender_address, owner));
+        int amount = in_msg_body~load_coins();
+        slice receiverWallet = in_msg_body~load_msg_addr();
+        slice responce_addr = in_msg_body~load_msg_addr();
+
+        balance -= amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master,0,initTransferMsg(amount, receiverWallet));
+        sendMsg(bounce::false(),sendMode::NONE(),responce_addr,event_fee(),initTransferEventMsg(owner, receiverWallet, amount));
+        save_data(owner, master, balance);
+        return();
+    }
+
+    throw(0xffff);
 }
 ```
 
@@ -610,7 +1036,6 @@ In the above code, after the user deposits the jetton into the `userWallet` cont
 **Risk Level: Medium**
 
 ## Gas Recovery
-
 Due to the above vulnerability, the developer will limit the number of incoming gas at the beginning of the message flow, even if it is the same entry function, the message flow will not execute all branches every time under certain circumstances, and some messages will be skipped in the middle of the flow, and the gas saved by these skipped messages will need to be refunded to the user. Strictly speaking, this will not lead to some serious problems in the contract, it will only keep the remaining gas in the contract, but it will make the user pay more commission than normal, so it is still recommended to refer to Jetton's standard implementation to return the excess gas as an EXIT message to the user, which is implemented by Jetton as follows:
 
 ```tact
