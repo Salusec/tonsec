@@ -531,7 +531,7 @@ Func:
 
 In this simple Jetton implementation, the contract implements the following flow: 
 
-![image-20240813161704417](.\README.assets\image-20240813161704417.png)
+![image-20240813161704417](./README.assets/image-20240813161704417.png)
 
 The above flow may have competing problems, e.g., wallet A has a balance of 5 Jetton, it can send a message to wallet B to transfer 5 Jetton twice, and since A's Jetton balance is not deducted in the first step, both of them can send `InternalTransfer` messages to wallet B without any problem, and wallet B's balance can be increased twice, and B will receive 10 Jetton, even if there is an exception in the third step when the balance is not enough, it will not be rolled back.
 
