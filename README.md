@@ -910,6 +910,8 @@ This is a very simple `master` contract, where the user can exchange his ton for
 
 The Jetton standard in TON does not currently have a transferFrom function, so many contracts use the transfer_notification message in the Jetton standard as the start message for a swap or deposit transaction. other problems due to asynchrony. However, if a fallback issue occurs in the execution flow, it can result in the user's assets sustaining a loss, for example:
 
+Tact:
+
 ```tact
 contract stakePool{
     totalsupply: Int as uint64;
@@ -934,6 +936,7 @@ contract stakePool{
     }
 
     receive(msg: WithdrawReply) { 
+        require(context().sender == self.userPool,"not userPool");
         self.totalsupply -= msg.amount;
         self.sendJetton(msg.amount,msg.sender);
     }
@@ -964,6 +967,103 @@ contract userPool{
 }
 ```
 
+Func:
+
+```func
+;;stakePool
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int total_supply, slice user_pool, slice lp_wallet) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer_notification() ){
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73,equal_slices(sender_address, lp_wallet));
+        throw_unless(500, msg_value >= common_fee())
+
+        total_supply += amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),user_pool,0,initDepositMsg(amount, from_address));
+        save_data(total_supply, user_pool, lp_wallet);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        throw_unless(500,msg_value >= common_fee());
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),user_pool,0,initWithdrawMsg(amount, from_address));
+        save_data(total_supply, user_pool, lp_wallet);
+        return();
+    }
+
+    if ( op == op::withdraw_reply() ){
+        throw_unless(73,equal_slices(sender_address, user_pool));
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+
+        send_jetton(amount, from_address);
+        save_data(total_supply, user_pool, lp_wallet);
+        return();
+    }
+
+    throw(0xffff);
+}
+
+;;userPool
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (int balance, slice owner, slice stake_pool) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73,equal_slices(sender_address, stake_pool));
+
+        balance += amount;
+        save_data(balance, owner, stake_pool);
+        return();
+    }
+
+    if ( op == op::withdraw() ){
+        throw_unless(73,equal_slices(sender_address, stake_pool));
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73,balance >= amount);
+
+        balance -= amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),stake_pool,0,initWithdrawReplyMsg(amount, from_address));
+        save_data(total_supply, user_pool, lp_wallet);
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
 The `stakePool` contract uses `JettonNotification` as the entry point for deposits and checks whether the gas is enough to satisfy the entire message flow. The contract uses require in the message to check whether the gas meets the requirements, but at this time the user has already transferred Jetton to the corresponding wallet of the contract, this time throwing an exception will result in the user transferring tokens not being taken out and thus locked up. The correct way to do it is to use the if check, and if it triggers the if block, then the user's incoming jetton will be sent back to the user's wallet.
 
 **Risk level: Medium**
@@ -971,6 +1071,8 @@ The `stakePool` contract uses `JettonNotification` as the entry point for deposi
 ## Erroneous Assertions in the Message Flow
 
 Due to the current problems with the bounce mechanism, it cannot be used as a means of preventing message processing failures and incomplete execution. Therefore, in the entry message of the entire message flow, it is necessary to check as much as possible all the contents that can be checked in the first step, to minimize the possibility of errors in subsequent messages, and minimize the use of required and other checking statements in the subsequent message, because a require failure may lead to the termination of the entire message flow. Because a required failure may lead to the termination of the entire message flow, it is prudent to check before use whether this fallback will lead to a state exception in the part of the message flow before this. For example:
+
+Tact:
 
 ```tact
 contract master{
@@ -1031,12 +1133,112 @@ contract userWallet{
 }
 ```
 
+Func:
+
+```
+;;master
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, slice jetton_wallet, cell wallet_addrs) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::transfer_notification() ){
+        int query_id = in_msg_body~load_uint(64);
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73,equal_slices(sender_address, jetton_wallet));
+        if (msg_value <= common_fee()){
+            send_jetton();
+            return();
+        }
+
+        (slice wallet, int flag) = wallet_addrs.dict_get(from_address);
+        if (wallet == null()){
+            send_jetton();
+            return();
+        }
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),wallet,0,initDepositMsg(jetton_amount, from_address));
+        save_data(owner, jetton_wallet, wallet_addrs);
+        return();
+    }
+
+    if ( op == op::transfer() ){
+        int amount = in_msg_body~load_coins();
+        slice sender_wallet = in_msg_body~load_msg_addr();
+        slice receiver_wallet = in_msg_body~load_msg_addr();
+        (slice sender, int flag) = wallet_addrs.dict_get(sender_wallet);
+        throw_unless(501, flag);
+        throw_unless(73,equal_slices(sender_address, sender));
+
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),receiver_wallet,0,initDepositMsg(amount, sender_wallet));
+        save_data(owner, jetton_wallet, wallet_addrs);
+        return();
+    }
+
+    throw(0xffff);
+}
+
+;;userWallet
+() recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
+    (slice owner, slice master, int balance) = load_data();
+    
+    var ctx = var (flags,sender_address,fwd_fee) = load_in_msg_full(in_msg_full);
+    if (flags & 1) { ;;ignore  bounced messages
+        return ();
+    }  
+
+    if (in_msg_body.slice_empty?()) { 
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    ;;begin to handle message
+    if ( op == op::deposit() ){
+        int jetton_amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        throw_unless(73,equal_slices(sender_address, master));
+
+        balance += jetton_amount;
+        save_data(owner, master, balance);
+        return();
+    }
+
+    if ( op == op::transfer() ){
+        throw_unless(73,equal_slices(sender_address, owner));
+        throw_unless(500, msg_value >= common_fee());
+        int amount = in_msg_body~load_coins();
+        slice sender_wallet = in_msg_body~load_msg_addr();
+        slice receiver_wallet = in_msg_body~load_msg_addr();
+
+        balance -= jetton_amount;
+        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master,0,initTransferMsg(amount, sender_wallet, receiver_wallet));
+        save_data(owner, master, balance);
+        return();
+    }
+
+    throw(0xffff);
+}
+```
+
 In the above code, after the user deposits the jetton into the `userWallet` contract through the `master` contract, at this point, when the user wants to transfer his internal balance to another user through the `Transfer` message when the message is successfully forwarded to the `master` contract if there is an error in the sender in the message, an exception is thrown and no corresponding amount is added to the recipient's The `userWallet` balance will not be increased by the corresponding amount, but at this point the `userWallet` has already been deducted from the user's balance, resulting in the assets that the user wants to transfer being locked up in the contract.
 
 **Risk Level: Medium**
 
 ## Gas Recovery
 Due to the above vulnerability, the developer will limit the number of incoming gas at the beginning of the message flow, even if it is the same entry function, the message flow will not execute all branches every time under certain circumstances, and some messages will be skipped in the middle of the flow, and the gas saved by these skipped messages will need to be refunded to the user. Strictly speaking, this will not lead to some serious problems in the contract, it will only keep the remaining gas in the contract, but it will make the user pay more commission than normal, so it is still recommended to refer to Jetton's standard implementation to return the excess gas as an EXIT message to the user, which is implemented by Jetton as follows:
+
+Tact:
 
 ```tact
 // 0xd53276db -- Cashback to the original Sender
@@ -1051,6 +1253,23 @@ Due to the above vulnerability, the developer will limit the number of incoming 
                 mode: SendIgnoreErrors
             });
         }
+```
+
+Func:
+
+```func
+if ((response_address.preload_uint(2) != 0) & (msg_value > 0)) {
+
+    var msg = begin_cell()
+      .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 010000
+      .store_slice(response_address)
+      .store_coins(msg_value)
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_uint(op::excesses(), 32)
+      .store_uint(query_id, 64);
+
+    send_raw_message(msg.end_cell(), 2);
+  }
 ```
 
 **Risk Level: Low**
