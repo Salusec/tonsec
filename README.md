@@ -105,6 +105,7 @@ contract masterChef{
         self.jettonWallet = jettonWallet;
     }
     receive(msg: Deposit) { 
++        require(context().value>= ton("0.05"),"not enough gas"); 
         self.updatePool();
         require(context().sender == self.jettonWallet,"not jettonWallet");
         self.totalsupply += msg.amount;
@@ -112,6 +113,7 @@ contract masterChef{
     }
 
     receive(msg: Withdraw) { 
++        require(context().value>= ton("0.05"),"not enough gas"); 
         self.updatePool();
         self.totalsupply -= msg.amount;
         msg.toCell().send_to(self.minichef);
@@ -176,6 +178,10 @@ Func:
 
     ;;begin to handle message
     if ( op == op::transfer_notification() ){;;Deposit
++        if (msg_value <= common_fee()){
++          send_jetton();
++            return();
++        }
         int query_id = in_msg_body~load_uint(64);
         int jetton_amount = in_msg_body~load_coins();
         slice from_address = in_msg_body~load_msg_addr();
@@ -188,6 +194,10 @@ Func:
     }
 
     if ( op == op::withdraw() ){
++        if (msg_value <= common_fee()){
++          send_jetton();
++            return();
++        }
         int amount = in_msg_body~load_coins();
         slice sender = in_msg_body~load_msg_addr();
 
@@ -198,7 +208,7 @@ Func:
         return();
     }
 
-    if ( op == op::withdrawReply() ){
+    if ( op == op::withdraw_reply() ){
         int amount = in_msg_body~load_coins();
         slice sender = in_msg_body~load_msg_addr();
 
@@ -298,6 +308,12 @@ contract masterChef{
         require(context().sender == self.minichef,"incorrect sender");
         self.sendJetton(msg.amount,msg.sender);
     }
++    bounced(src: bounced<Withdraw>) {
++        self.totalsupply = self.totalsupply + src.amount;
++   }
++    bounced(src: bounced<Deposit>) {
++        self.totalsupply = self.totalsupply - src.amount;
++    }
     inline fun updatePool() {
         if (self.totalsupply > 0 ) {
             let reward: Int = (now() - self.lastRewardBlock) * self.rewardPerSecond;
@@ -330,6 +346,9 @@ contract miniChef{
             sender: msg.sender
         }.toCell().send_to(self.masterchef);
     }
++    bounced(src: bounced<WithdrawReply>) {
++        self.amount = self.amount + src.amount;
++    }
 }
 ```
 
@@ -337,6 +356,19 @@ Func:
 
 ```Func
 ;;masterChef
++() on_bounce(slice in_msg_body) impure {
++  in_msg_body~skip_bits(32); ;; 0xFFFFFFFF
++  (int total_supply, slice miniChef,slice jetton_wallet, int last_reward_block, int reward_per_second, int acc_reward_per_share) = load_data();
++  int op = in_msg_body~load_uint(32);
++  throw_unless(709, (op == op::deposit()) | (op == op::withdraw()));
++  int amount = in_msg_body~load_coins();
++  if (op == op::deposit()){
++    total_supply -= amount;
++  }else{
++   total_supply += amount;
++  }
++  save_data(balance, owner_address, jetton_master_address, jetton_wallet_code);
++}
 () recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
     (int total_supply, slice miniChef,slice jetton_wallet, int last_reward_block, int reward_per_second, int acc_reward_per_share) = load_data();
     
@@ -375,7 +407,7 @@ Func:
         return();
     }
 
-    if ( op == op::withdrawReply() ){
+    if ( op == op::withdraw_reply() ){
         int amount = in_msg_body~load_coins();
         slice sender = in_msg_body~load_msg_addr();
 
@@ -389,6 +421,15 @@ Func:
 
 
 ;;miniChef
++() on_bounce(slice in_msg_body) impure {
++  in_msg_body~skip_bits(32); ;; 0xFFFFFFFF
++  (slice owner, slice master_chef, int balance) = load_data();
++  int op = in_msg_body~load_uint(32);
++  throw_unless(709, op == op::deposit());
++  int amount = in_msg_body~load_coins();
++  balance += amount;
++  save_data(balance, owner_address, jetton_master_address, jetton_wallet_code);
++}
 () recv_internal(int my_balance,int msg_value, cell in_msg_full, slice in_msg_body) impure { 
     (slice owner, slice master_chef, int balance) = load_data();
     
@@ -789,8 +830,10 @@ contract userWallet{
         self.amount -= msg.amount;
         send(SendParameters{
                 to: self.master,
-                value: msg.amount,
-                mode: SendRemainingValue + SendIgnoreErrors,
+-                value: msg.amount,
+-                mode: SendRemainingValue + SendIgnoreErrors,
++                value: context().value-ton("0.0001"),
++                mode: SendIgnoreErrors,
                 bounce: false,
                 body: Transfer {
                     amount: msg.amount,
@@ -839,7 +882,8 @@ Func:
         slice responce_addr = in_msg_body~load_msg_addr();
 
         balance -= amount;
-        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master,0,initTransferMsg(amount, receiverWallet));
+-        sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),master,0,initTransferMsg(amount, receiverWallet));
++		 sendMsg(bounce::false(),sendMode::NONE(),master,msg_value- event_fee(),initTransferMsg(amount, receiverWallet));
         sendMsg(bounce::false(),sendMode::NONE(),responce_addr,event_fee(),initTransferEventMsg(owner, receiverWallet, amount));
         save_data(owner, master, balance);
         return();
@@ -874,12 +918,14 @@ In func, when processing message logic, the contract state variables need to be 
 
     ;;begin to handle message
     if ( op == op::mint() ){
-        slice jetton_wallet = in_msg_body~load_msg_addr();
+-        slice jetton_wallet = in_msg_body~load_msg_addr();
++        slice receiver_wallet = in_msg_body~load_msg_addr();
         int amount = in_msg_body~load_coins();
         throw_unless(500, msg_value >= (amount + mint_gas()));
 
         total_supply += amount;
-        sendMsg(bounce::true(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),jetton_master,0,initMintMsg(jetton_wallet, amount));
+-        sendMsg(bounce::true(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),jetton_master,0,initMintMsg(jetton_wallet, amount));
++        sendMsg(bounce::true(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),jetton_master,0,initMintMsg(receiver_wallet, amount));
         save_data(total_supply,jetton_master,jetton_wallet)
         return();
     }
@@ -924,7 +970,11 @@ contract stakePool{
 
     }
     receive(msg: JettonNotification) { 
-        require(context().value >= ton("0.05"),"insufficient gas");
+-        require(context().value >= ton("0.05"),"insufficient gas");
++        if(context().value >= ton("0.05")){
++            self.sendJetton(msg.amount, msg.sender);
++            return;
++        }
         require(context().sender == self.lpTokenWallet,"incorrect jetton");
         self.totalsupply += msg.amount;
         msg.toCell().send_to(self.userPool);
@@ -991,7 +1041,11 @@ Func:
         int jetton_amount = in_msg_body~load_coins();
         slice from_address = in_msg_body~load_msg_addr();
         throw_unless(73,equal_slices(sender_address, lp_wallet));
-        throw_unless(500, msg_value >= common_fee())
+-        throw_unless(500, msg_value >= common_fee());
++        if(msg_value <= common_fee()){
++            send_jetton(jetton_amount,from_address);
++            return();
++        }
 
         total_supply += amount;
         sendMsg(bounce::false(),sendMode::CARRY_ALL_REMAINING_INCOMING_VALUE(),user_pool,0,initDepositMsg(amount, from_address));
